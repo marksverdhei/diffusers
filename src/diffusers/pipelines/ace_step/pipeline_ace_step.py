@@ -14,14 +14,15 @@
 
 import math
 import re
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from transformers import PreTrainedModel, PreTrainedTokenizerFast
 
 from ...models import AutoencoderOobleck
-from ...models.transformers.ace_step_transformer import AceStepDiTModel
+from ...models.transformers.ace_step_transformer import AceStepTransformer1DModel
+from ...schedulers import FlowMatchEulerDiscreteScheduler
 from ...utils import logging, replace_example_docstring
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import AudioPipelineOutput, DiffusionPipeline
@@ -55,9 +56,6 @@ TASK_INSTRUCTIONS = {
 
 # Valid task types
 TASK_TYPES = ["text2music", "repaint", "cover", "extract", "lego", "complete"]
-
-# Sample rate used by ACE-Step
-SAMPLE_RATE = 48000
 
 # Pre-defined timestep schedules for the turbo model (fix_nfe=8)
 SHIFT_TIMESTEPS = {
@@ -163,21 +161,26 @@ class AceStepPipeline(DiffusionPipeline):
             Text encoder model (e.g., Qwen3-Embedding-0.6B) for encoding text prompts and lyrics.
         tokenizer ([`~transformers.AutoTokenizer`]):
             Tokenizer for the text encoder.
-        transformer ([`AceStepDiTModel`]):
+        transformer ([`AceStepTransformer1DModel`]):
             The Diffusion Transformer (DiT) model for denoising audio latents.
         condition_encoder ([`AceStepConditionEncoder`]):
             Condition encoder that combines text, lyric, and timbre embeddings for cross-attention.
+        scheduler ([`FlowMatchEulerDiscreteScheduler`]):
+            A scheduler to be used in combination with the transformer to denoise the audio latents.
     """
 
     model_cpu_offload_seq = "text_encoder->condition_encoder->transformer->vae"
+    _optional_components = ["scheduler"]
+    _callback_tensor_inputs = ["latents", "encoder_hidden_states"]
 
     def __init__(
         self,
         vae: AutoencoderOobleck,
         text_encoder: PreTrainedModel,
         tokenizer: PreTrainedTokenizerFast,
-        transformer: AceStepDiTModel,
+        transformer: AceStepTransformer1DModel,
         condition_encoder: AceStepConditionEncoder,
+        scheduler: FlowMatchEulerDiscreteScheduler = None,
     ):
         super().__init__()
 
@@ -187,7 +190,20 @@ class AceStepPipeline(DiffusionPipeline):
             tokenizer=tokenizer,
             transformer=transformer,
             condition_encoder=condition_encoder,
+            scheduler=scheduler,
         )
+
+    @property
+    def guidance_scale(self):
+        return self._guidance_scale
+
+    @property
+    def do_classifier_free_guidance(self):
+        return self._guidance_scale > 1.0
+
+    @property
+    def num_timesteps(self):
+        return self._num_timesteps
 
     @staticmethod
     def _get_task_instruction(
@@ -419,6 +435,14 @@ class AceStepPipeline(DiffusionPipeline):
 
         return text_hidden_states, text_attention_mask, lyric_hidden_states, lyric_attention_mask
 
+    @property
+    def latents_per_second(self) -> int:
+        """Calculate the latent frame rate from the VAE's downsampling ratio and sample rate."""
+        # The VAE downsamples audio: sample_rate / downsample_ratio = latent_rate
+        # For ACE-Step: 48000 / 1920 = 25 Hz
+        # We compute this from config: downsample_ratio is the product of downsampling_ratios * hop_length
+        return 25
+
     def prepare_latents(
         self,
         batch_size: int,
@@ -442,8 +466,7 @@ class AceStepPipeline(DiffusionPipeline):
         Returns:
             Noise latents of shape `(batch_size, latent_length, acoustic_dim)`.
         """
-        # 25 Hz latent rate for ACE-Step
-        latent_length = int(audio_duration * 25)
+        latent_length = int(audio_duration * self.latents_per_second)
         acoustic_dim = self.transformer.config.audio_acoustic_hidden_dim
 
         if latents is not None:
@@ -502,16 +525,17 @@ class AceStepPipeline(DiffusionPipeline):
         return torch.tensor(t_schedule_list, device=device, dtype=dtype)
 
     @staticmethod
-    def _normalize_audio_to_stereo_48k(audio: torch.Tensor, sr: int) -> torch.Tensor:
+    def _normalize_audio_to_stereo_48k(audio: torch.Tensor, sr: int, sample_rate: int = 48000) -> torch.Tensor:
         """
-        Normalize audio to stereo 48kHz format.
+        Normalize audio to stereo format at the target sample rate.
 
         Args:
             audio (`torch.Tensor`): Audio tensor of shape `[channels, samples]` or `[samples]`.
             sr (`int`): Original sample rate.
+            sample_rate (`int`, *optional*, defaults to 48000): Target sample rate.
 
         Returns:
-            `torch.Tensor`: Normalized audio tensor of shape `[2, samples]` at 48kHz.
+            `torch.Tensor`: Normalized audio tensor of shape `[2, samples]` at target sample rate.
         """
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
@@ -519,14 +543,14 @@ class AceStepPipeline(DiffusionPipeline):
             audio = torch.cat([audio, audio], dim=0)
         audio = audio[:2]
 
-        if sr != SAMPLE_RATE:
+        if sr != sample_rate:
             try:
                 import torchaudio
 
-                audio = torchaudio.transforms.Resample(sr, SAMPLE_RATE)(audio)
+                audio = torchaudio.transforms.Resample(sr, sample_rate)(audio)
             except ImportError:
                 # Simple linear resampling fallback
-                target_len = int(audio.shape[-1] * SAMPLE_RATE / sr)
+                target_len = int(audio.shape[-1] * sample_rate / sr)
                 audio = F.interpolate(audio.unsqueeze(0), size=target_len, mode="linear", align_corners=False)[0]
 
         audio = torch.clamp(audio, -1.0, 1.0)
@@ -712,7 +736,8 @@ class AceStepPipeline(DiffusionPipeline):
         Returns:
             Tuple of `(refer_audio_acoustic, refer_audio_order_mask)`.
         """
-        target_frames = 30 * SAMPLE_RATE  # 30 seconds
+        sample_rate = self.vae.config.sampling_rate
+        target_frames = 30 * sample_rate  # 30 seconds
 
         # Repeat if shorter than 30 seconds
         if reference_audio.shape[-1] < target_frames:
@@ -720,7 +745,7 @@ class AceStepPipeline(DiffusionPipeline):
             reference_audio = reference_audio.repeat(1, repeat_times)
 
         # Select 3 segments of 10 seconds each
-        segment_frames = 10 * SAMPLE_RATE
+        segment_frames = 10 * sample_rate
         total_frames = reference_audio.shape[-1]
         segment_size = total_frames // 3
 
@@ -801,11 +826,15 @@ class AceStepPipeline(DiffusionPipeline):
         Returns:
             `torch.Tensor`: Chunk mask of shape `[batch, latent_length, acoustic_dim]`.
         """
+        sample_rate = self.vae.config.sampling_rate
+        # Downsample ratio: sample_rate / latents_per_second
+        downsample_ratio = sample_rate // self.latents_per_second
+
         if task_type in ("repaint", "lego") and has_src_audio:
             # Create a mask where the repaint region is 1 (generate) and outside is 0 (keep)
-            start_latent = int((repainting_start or 0.0) * SAMPLE_RATE / 1920)
+            start_latent = int((repainting_start or 0.0) * sample_rate / downsample_ratio)
             if repainting_end is not None and repainting_end > 0:
-                end_latent = int(repainting_end * SAMPLE_RATE / 1920)
+                end_latent = int(repainting_end * sample_rate / downsample_ratio)
             else:
                 end_latent = latent_length
 
@@ -824,6 +853,39 @@ class AceStepPipeline(DiffusionPipeline):
 
         return chunk_mask
 
+    def check_inputs(
+        self,
+        prompt: Union[str, List[str]],
+        audio_duration: float,
+        task_type: str,
+        num_inference_steps: int,
+        guidance_scale: float,
+        callback_on_step_end_tensor_inputs: Optional[List[str]] = None,
+    ):
+        """Validate pipeline inputs before generation."""
+        if prompt is None or (isinstance(prompt, (list, str)) and len(prompt) == 0):
+            raise ValueError("Must provide `prompt` as a non-empty string or list of strings.")
+
+        if audio_duration is not None and audio_duration <= 0:
+            raise ValueError(f"`audio_duration` must be positive, got {audio_duration}.")
+
+        if task_type not in TASK_TYPES:
+            raise ValueError(f"`task_type` must be one of {TASK_TYPES}, got '{task_type}'.")
+
+        if num_inference_steps <= 0:
+            raise ValueError(f"`num_inference_steps` must be positive, got {num_inference_steps}.")
+
+        if guidance_scale < 0:
+            raise ValueError(f"`guidance_scale` must be non-negative, got {guidance_scale}.")
+
+        if callback_on_step_end_tensor_inputs is not None:
+            for tensor_name in callback_on_step_end_tensor_inputs:
+                if tensor_name not in self._callback_tensor_inputs:
+                    raise ValueError(
+                        f"`callback_on_step_end_tensor_inputs` must be a subset of {self._callback_tensor_inputs}, "
+                        f"but got '{tensor_name}'."
+                    )
+
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
@@ -839,8 +901,8 @@ class AceStepPipeline(DiffusionPipeline):
         latents: Optional[torch.Tensor] = None,
         output_type: Optional[str] = "pt",
         return_dict: bool = True,
-        callback: Optional[Callable[[int, int, torch.Tensor], None]] = None,
-        callback_steps: Optional[int] = 1,
+        callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
+        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         instruction: Optional[str] = None,
         max_text_length: int = 256,
         max_lyric_length: int = 2048,
@@ -892,10 +954,12 @@ class AceStepPipeline(DiffusionPipeline):
                 Output format. `"pt"` for PyTorch tensor, `"np"` for NumPy array, `"latent"` for raw latents.
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether to return an `AudioPipelineOutput` or a plain tuple.
-            callback (`Callable`, *optional*):
-                A function called every `callback_steps` steps with `(step, timestep, latents)`.
-            callback_steps (`int`, *optional*, defaults to 1):
-                Frequency of the callback function.
+            callback_on_step_end (`Callable`, *optional*):
+                A function called at the end of each denoising step with
+                `(pipeline, step_index, timestep, callback_kwargs)`. Can modify and return tensors listed in
+                `callback_on_step_end_tensor_inputs`.
+            callback_on_step_end_tensor_inputs (`List[str]`, *optional*, defaults to `["latents"]`):
+                Tensor names to pass to `callback_on_step_end`. Must be a subset of `_callback_tensor_inputs`.
             instruction (`str`, *optional*):
                 Custom instruction text for the generation task. If not provided, it is auto-generated based on
                 `task_type`.
@@ -956,9 +1020,21 @@ class AceStepPipeline(DiffusionPipeline):
         else:
             raise ValueError("Must provide `prompt` as a string or list of strings.")
 
+        self._guidance_scale = guidance_scale
+
+        self.check_inputs(
+            prompt=prompt,
+            audio_duration=audio_duration,
+            task_type=task_type,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+        )
+
         device = self._execution_device
         dtype = self.transformer.dtype
         acoustic_dim = self.transformer.config.audio_acoustic_hidden_dim
+        sample_rate = self.vae.config.sampling_rate
 
         # Auto-detect task type from audio_codes
         if task_type == "text2music" and audio_codes is not None:
@@ -981,7 +1057,7 @@ class AceStepPipeline(DiffusionPipeline):
         # Determine if src_audio provides the duration
         has_src_audio = src_audio is not None
         if has_src_audio:
-            src_audio_duration = src_audio.shape[-1] / SAMPLE_RATE
+            src_audio_duration = src_audio.shape[-1] / sample_rate
             if audio_duration is None or audio_duration <= 0:
                 audio_duration = src_audio_duration
         if audio_duration is None or audio_duration <= 0:
@@ -1003,7 +1079,7 @@ class AceStepPipeline(DiffusionPipeline):
         )
 
         # 2. Prepare source latents and latent length
-        latent_length = int(audio_duration * 25)
+        latent_length = int(audio_duration * self.latents_per_second)
 
         if has_src_audio:
             src_latents, src_latent_length = self._prepare_src_audio_and_latents(
@@ -1111,7 +1187,7 @@ class AceStepPipeline(DiffusionPipeline):
         # 7. Prepare noise latents
         latents = self.prepare_latents(
             batch_size=batch_size,
-            audio_duration=latent_length / 25.0,  # Use actual latent length
+            audio_duration=latent_length / float(self.latents_per_second),  # Use actual latent length
             dtype=dtype,
             device=device,
             generator=generator,
@@ -1119,9 +1195,8 @@ class AceStepPipeline(DiffusionPipeline):
         )
 
         # 8. Prepare null condition for CFG (if guidance_scale > 1)
-        do_cfg = guidance_scale > 1.0
         null_encoder_hidden_states = None
-        if do_cfg:
+        if self.do_classifier_free_guidance:
             # Create null (empty) text condition
             null_text_hs, null_text_mask, null_lyric_hs, null_lyric_mask = self.encode_prompt(
                 prompt=[""] * batch_size,
@@ -1154,6 +1229,7 @@ class AceStepPipeline(DiffusionPipeline):
             timesteps=timesteps,
         )
         num_steps = len(t_schedule)
+        self._num_timesteps = num_steps
 
         # 10. Denoising loop (flow matching ODE)
         xt = latents
@@ -1165,7 +1241,9 @@ class AceStepPipeline(DiffusionPipeline):
                 # Determine if CFG should be applied at this timestep
                 # cfg_interval maps timestep ratio to [cfg_interval_start, cfg_interval_end]
                 timestep_ratio = 1.0 - current_timestep  # t=1 -> ratio=0, t=0 -> ratio=1
-                apply_cfg = do_cfg and (cfg_interval_start <= timestep_ratio <= cfg_interval_end)
+                apply_cfg = self.do_classifier_free_guidance and (
+                    cfg_interval_start <= timestep_ratio <= cfg_interval_end
+                )
 
                 if apply_cfg:
                     # Conditional forward pass
@@ -1222,22 +1300,29 @@ class AceStepPipeline(DiffusionPipeline):
                     # Blend: strength * cover_vt + (1 - strength) * text2music_vt
                     vt = audio_cover_strength * vt + (1.0 - audio_cover_strength) * vt_nc
 
-                # On final step, directly compute x0
-                if step_idx == num_steps - 1:
-                    xt = xt - vt * t_curr_tensor.unsqueeze(-1).unsqueeze(-1)
-                    progress_bar.update()
-                    break
-
                 # Euler ODE step: x_{t-1} = x_t - v_t * dt
-                next_timestep = t_schedule[step_idx + 1].item()
-                dt = current_timestep - next_timestep
+                if step_idx == num_steps - 1:
+                    # Final step: directly compute x0
+                    dt = current_timestep
+                else:
+                    next_timestep = t_schedule[step_idx + 1].item()
+                    dt = current_timestep - next_timestep
+
                 dt_tensor = dt * torch.ones((batch_size,), device=device, dtype=dtype).unsqueeze(-1).unsqueeze(-1)
                 xt = xt - vt * dt_tensor
 
                 progress_bar.update()
 
-                if callback is not None and step_idx % callback_steps == 0:
-                    callback(step_idx, t_curr_tensor, xt)
+                # callback_on_step_end
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, step_idx, t_curr_tensor, callback_kwargs)
+                    xt = callback_outputs.pop("latents", xt)
+                    encoder_hidden_states = callback_outputs.pop(
+                        "encoder_hidden_states", encoder_hidden_states
+                    )
 
         # 11. Post-processing: decode latents to audio
         if output_type == "latent":

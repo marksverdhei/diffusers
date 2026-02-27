@@ -311,7 +311,7 @@ def apply_taylorseer_cache(*args, **kwargs):
     requires_backends(apply_taylorseer_cache, ["torch"])
 
 
-class AceStepDiTModel(metaclass=DummyObject):
+class AceStepTransformer1DModel(metaclass=DummyObject):
     _backends = ["torch"]
 
     def __init__(self, *args, **kwargs):

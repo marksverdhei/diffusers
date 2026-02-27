@@ -13,32 +13,108 @@
 # limitations under the License.
 
 """
-Pipeline-specific models for ACE-Step 1.5: ConditionEncoder, LyricEncoder, TimbreEncoder, AudioTokenizer, and
-AudioTokenDetokenizer.
+Pipeline-specific models for ACE-Step 1.5: ConditionEncoder, LyricEncoder, TimbreEncoder, and encoder layers.
 
 These models are used within the AceStepPipeline to encode conditioning inputs (text, lyrics, timbre) for
 cross-attention in the DiT model.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ...configuration_utils import ConfigMixin, register_to_config
+from ...models.embeddings import apply_rotary_emb, get_1d_rotary_pos_embed
 from ...models.modeling_utils import ModelMixin
-from ...models.transformers.ace_step_transformer import (
-    AceStepEncoderLayer,
-    AceStepRMSNorm,
-    AceStepRotaryEmbedding,
-    _create_4d_mask,
-    _pack_sequences,
-)
+from ...models.normalization import RMSNorm
+from ...models.transformers.ace_step_transformer import AceStepAttention, AceStepMLP, _create_4d_mask
 from ...utils import logging
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+def _pack_sequences(
+    hidden1: torch.Tensor, hidden2: torch.Tensor, mask1: torch.Tensor, mask2: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack two sequences by concatenating and sorting valid tokens first.
+
+    Args:
+        hidden1: First hidden states `[B, L1, D]`.
+        hidden2: Second hidden states `[B, L2, D]`.
+        mask1: Mask for first sequence `[B, L1]`.
+        mask2: Mask for second sequence `[B, L2]`.
+
+    Returns:
+        Tuple of `(packed_hidden_states, new_mask)` with valid tokens sorted first.
+    """
+    hidden_cat = torch.cat([hidden1, hidden2], dim=1)
+    mask_cat = torch.cat([mask1, mask2], dim=1)
+
+    B, L, D = hidden_cat.shape
+    sort_idx = mask_cat.argsort(dim=1, descending=True, stable=True)
+    hidden_left = torch.gather(hidden_cat, 1, sort_idx.unsqueeze(-1).expand(B, L, D))
+    lengths = mask_cat.sum(dim=1)
+    new_mask = torch.arange(L, dtype=torch.long, device=hidden_cat.device).unsqueeze(0) < lengths.unsqueeze(1)
+    return hidden_left, new_mask
+
+
+class AceStepEncoderLayer(nn.Module):
+    """
+    Encoder layer for the ACE-Step condition encoders (lyric and timbre).
+
+    Consists of self-attention and MLP (feed-forward) sub-layers with residual connections.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_attention_heads: int,
+        num_key_value_heads: int,
+        head_dim: int,
+        intermediate_size: int,
+        attention_bias: bool = False,
+        attention_dropout: float = 0.0,
+        rms_norm_eps: float = 1e-6,
+        sliding_window: Optional[int] = None,
+    ):
+        super().__init__()
+        self.self_attn = AceStepAttention(
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
+            head_dim=head_dim,
+            attention_bias=attention_bias,
+            attention_dropout=attention_dropout,
+            rms_norm_eps=rms_norm_eps,
+        )
+        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.mlp = AceStepMLP(hidden_size, intermediate_size)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
 
 
 class AceStepLyricEncoder(ModelMixin, ConfigMixin):
@@ -63,8 +139,6 @@ class AceStepLyricEncoder(ModelMixin, ConfigMixin):
             Number of key/value heads for grouped query attention.
         head_dim (`int`, defaults to 128):
             Dimension of each attention head.
-        max_position_embeddings (`int`, defaults to 32768):
-            Maximum sequence length for rotary embeddings.
         rope_theta (`float`, defaults to 1000000.0):
             Base period of the RoPE embeddings.
         attention_bias (`bool`, defaults to `False`):
@@ -73,13 +147,13 @@ class AceStepLyricEncoder(ModelMixin, ConfigMixin):
             Dropout probability for attention weights.
         rms_norm_eps (`float`, defaults to 1e-6):
             Epsilon for RMS normalization.
-        use_sliding_window (`bool`, defaults to `True`):
-            Whether to use sliding window attention.
         sliding_window (`int`, defaults to 128):
             Sliding window size.
         layer_types (`list`, *optional*):
             Attention pattern for each layer.
     """
+
+    _supports_gradient_checkpointing = True
 
     @register_to_config
     def __init__(
@@ -91,12 +165,10 @@ class AceStepLyricEncoder(ModelMixin, ConfigMixin):
         num_attention_heads: int = 16,
         num_key_value_heads: int = 8,
         head_dim: int = 128,
-        max_position_embeddings: int = 32768,
         rope_theta: float = 1000000.0,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
         rms_norm_eps: float = 1e-6,
-        use_sliding_window: bool = True,
         sliding_window: int = 128,
         layer_types: list = None,
     ):
@@ -109,10 +181,7 @@ class AceStepLyricEncoder(ModelMixin, ConfigMixin):
             ]
 
         self.embed_tokens = nn.Linear(text_hidden_dim, hidden_size)
-        self.norm = AceStepRMSNorm(hidden_size, eps=rms_norm_eps)
-        self.rotary_emb = AceStepRotaryEmbedding(
-            dim=head_dim, max_position_embeddings=max_position_embeddings, base=rope_theta
-        )
+        self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         self.layers = nn.ModuleList(
             [
@@ -132,8 +201,8 @@ class AceStepLyricEncoder(ModelMixin, ConfigMixin):
         )
 
         self._layer_types = layer_types
-        self._use_sliding_window = use_sliding_window
         self._sliding_window = sliding_window
+        self.gradient_checkpointing = False
 
     def forward(
         self,
@@ -156,38 +225,45 @@ class AceStepLyricEncoder(ModelMixin, ConfigMixin):
         dtype = inputs_embeds.dtype
         device = inputs_embeds.device
 
-        position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
-        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
+        position_embeddings = get_1d_rotary_pos_embed(
+            self.config.head_dim, seq_len, theta=self.config.rope_theta, use_real=True, repeat_interleave_real=False
+        )
 
         # Build attention masks
         full_attn_mask = _create_4d_mask(
             seq_len=seq_len, dtype=dtype, device=device, attention_mask=attention_mask, is_causal=False
         )
-        sliding_attn_mask = None
-        if self._use_sliding_window:
-            sliding_attn_mask = _create_4d_mask(
-                seq_len=seq_len,
-                dtype=dtype,
-                device=device,
-                attention_mask=attention_mask,
-                sliding_window=self._sliding_window,
-                is_sliding_window=True,
-                is_causal=False,
-            )
+        sliding_attn_mask = _create_4d_mask(
+            seq_len=seq_len,
+            dtype=dtype,
+            device=device,
+            attention_mask=attention_mask,
+            sliding_window=self._sliding_window,
+            is_sliding_window=True,
+            is_causal=False,
+        )
 
         hidden_states = inputs_embeds
         for i, layer_module in enumerate(self.layers):
             layer_type = self._layer_types[i]
-            if layer_type == "sliding_attention" and sliding_attn_mask is not None:
+            if layer_type == "sliding_attention":
                 mask = sliding_attn_mask
             else:
                 mask = full_attn_mask
 
-            hidden_states = layer_module(
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-                attention_mask=mask,
-            )
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                hidden_states = self._gradient_checkpointing_func(
+                    layer_module.__call__,
+                    hidden_states,
+                    position_embeddings,
+                    mask,
+                )
+            else:
+                hidden_states = layer_module(
+                    hidden_states=hidden_states,
+                    position_embeddings=position_embeddings,
+                    attention_mask=mask,
+                )
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
@@ -215,8 +291,6 @@ class AceStepTimbreEncoder(ModelMixin, ConfigMixin):
             Number of key/value heads.
         head_dim (`int`, defaults to 128):
             Dimension of each attention head.
-        max_position_embeddings (`int`, defaults to 32768):
-            Maximum sequence length for rotary embeddings.
         rope_theta (`float`, defaults to 1000000.0):
             Base period of the RoPE embeddings.
         attention_bias (`bool`, defaults to `False`):
@@ -225,13 +299,13 @@ class AceStepTimbreEncoder(ModelMixin, ConfigMixin):
             Dropout probability for attention weights.
         rms_norm_eps (`float`, defaults to 1e-6):
             Epsilon for RMS normalization.
-        use_sliding_window (`bool`, defaults to `True`):
-            Whether to use sliding window attention.
         sliding_window (`int`, defaults to 128):
             Sliding window size.
         layer_types (`list`, *optional*):
             Attention pattern for each layer.
     """
+
+    _supports_gradient_checkpointing = True
 
     @register_to_config
     def __init__(
@@ -243,12 +317,10 @@ class AceStepTimbreEncoder(ModelMixin, ConfigMixin):
         num_attention_heads: int = 16,
         num_key_value_heads: int = 8,
         head_dim: int = 128,
-        max_position_embeddings: int = 32768,
         rope_theta: float = 1000000.0,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
         rms_norm_eps: float = 1e-6,
-        use_sliding_window: bool = True,
         sliding_window: int = 128,
         layer_types: list = None,
     ):
@@ -261,10 +333,7 @@ class AceStepTimbreEncoder(ModelMixin, ConfigMixin):
             ]
 
         self.embed_tokens = nn.Linear(timbre_hidden_dim, hidden_size)
-        self.norm = AceStepRMSNorm(hidden_size, eps=rms_norm_eps)
-        self.rotary_emb = AceStepRotaryEmbedding(
-            dim=head_dim, max_position_embeddings=max_position_embeddings, base=rope_theta
-        )
+        self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.special_token = nn.Parameter(torch.randn(1, 1, hidden_size))
 
         self.layers = nn.ModuleList(
@@ -285,8 +354,8 @@ class AceStepTimbreEncoder(ModelMixin, ConfigMixin):
         )
 
         self._layer_types = layer_types
-        self._use_sliding_window = use_sliding_window
         self._sliding_window = sliding_window
+        self.gradient_checkpointing = False
 
     @staticmethod
     def unpack_timbre_embeddings(
@@ -359,38 +428,45 @@ class AceStepTimbreEncoder(ModelMixin, ConfigMixin):
         dtype = inputs_embeds.dtype
         device = inputs_embeds.device
 
-        position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
-        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
+        position_embeddings = get_1d_rotary_pos_embed(
+            self.config.head_dim, seq_len, theta=self.config.rope_theta, use_real=True, repeat_interleave_real=False
+        )
 
         # Build attention masks
         full_attn_mask = _create_4d_mask(
             seq_len=seq_len, dtype=dtype, device=device, attention_mask=None, is_causal=False
         )
-        sliding_attn_mask = None
-        if self._use_sliding_window:
-            sliding_attn_mask = _create_4d_mask(
-                seq_len=seq_len,
-                dtype=dtype,
-                device=device,
-                attention_mask=None,
-                sliding_window=self._sliding_window,
-                is_sliding_window=True,
-                is_causal=False,
-            )
+        sliding_attn_mask = _create_4d_mask(
+            seq_len=seq_len,
+            dtype=dtype,
+            device=device,
+            attention_mask=None,
+            sliding_window=self._sliding_window,
+            is_sliding_window=True,
+            is_causal=False,
+        )
 
         hidden_states = inputs_embeds
         for i, layer_module in enumerate(self.layers):
             layer_type = self._layer_types[i]
-            if layer_type == "sliding_attention" and sliding_attn_mask is not None:
+            if layer_type == "sliding_attention":
                 mask = sliding_attn_mask
             else:
                 mask = full_attn_mask
 
-            hidden_states = layer_module(
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-                attention_mask=mask,
-            )
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                hidden_states = self._gradient_checkpointing_func(
+                    layer_module.__call__,
+                    hidden_states,
+                    position_embeddings,
+                    mask,
+                )
+            else:
+                hidden_states = layer_module(
+                    hidden_states=hidden_states,
+                    position_embeddings=position_embeddings,
+                    attention_mask=mask,
+                )
 
         hidden_states = self.norm(hidden_states)
         # Extract first token (CLS-like) as timbre embedding
@@ -425,8 +501,6 @@ class AceStepConditionEncoder(ModelMixin, ConfigMixin):
             Number of key/value heads.
         head_dim (`int`, defaults to 128):
             Dimension of each attention head.
-        max_position_embeddings (`int`, defaults to 32768):
-            Maximum sequence length for rotary embeddings.
         rope_theta (`float`, defaults to 1000000.0):
             Base period of the RoPE embeddings.
         attention_bias (`bool`, defaults to `False`):
@@ -435,8 +509,6 @@ class AceStepConditionEncoder(ModelMixin, ConfigMixin):
             Dropout probability for attention weights.
         rms_norm_eps (`float`, defaults to 1e-6):
             Epsilon for RMS normalization.
-        use_sliding_window (`bool`, defaults to `True`):
-            Whether to use sliding window attention.
         sliding_window (`int`, defaults to 128):
             Sliding window size.
         layer_types (`list`, *optional*):
@@ -455,12 +527,10 @@ class AceStepConditionEncoder(ModelMixin, ConfigMixin):
         num_attention_heads: int = 16,
         num_key_value_heads: int = 8,
         head_dim: int = 128,
-        max_position_embeddings: int = 32768,
         rope_theta: float = 1000000.0,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
         rms_norm_eps: float = 1e-6,
-        use_sliding_window: bool = True,
         sliding_window: int = 128,
         layer_types: list = None,
     ):
@@ -478,12 +548,10 @@ class AceStepConditionEncoder(ModelMixin, ConfigMixin):
             num_attention_heads=num_attention_heads,
             num_key_value_heads=num_key_value_heads,
             head_dim=head_dim,
-            max_position_embeddings=max_position_embeddings,
             rope_theta=rope_theta,
             attention_bias=attention_bias,
             attention_dropout=attention_dropout,
             rms_norm_eps=rms_norm_eps,
-            use_sliding_window=use_sliding_window,
             sliding_window=sliding_window,
             layer_types=layer_types,
         )
@@ -497,12 +565,10 @@ class AceStepConditionEncoder(ModelMixin, ConfigMixin):
             num_attention_heads=num_attention_heads,
             num_key_value_heads=num_key_value_heads,
             head_dim=head_dim,
-            max_position_embeddings=max_position_embeddings,
             rope_theta=rope_theta,
             attention_bias=attention_bias,
             attention_dropout=attention_dropout,
             rms_norm_eps=rms_norm_eps,
-            use_sliding_window=use_sliding_window,
             sliding_window=sliding_window,
         )
 

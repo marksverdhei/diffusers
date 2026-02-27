@@ -6,6 +6,12 @@
 #       --dit_config acestep-v15-turbo \
 #       --output_dir /path/to/output/ACE-Step-v1-5-turbo \
 #       --dtype bf16
+#
+#   # Or from a HuggingFace Hub repo:
+#   python scripts/convert_ace_step_to_diffusers.py \
+#       --repo_id ACE-Step/ACE-Step-v1-5-turbo \
+#       --output_dir /path/to/output/ACE-Step-v1-5-turbo \
+#       --dtype bf16
 
 import argparse
 import json
@@ -14,6 +20,83 @@ import shutil
 
 import torch
 from safetensors.torch import load_file, save_file
+
+
+def _remap_transformer_key(key: str) -> str:
+    """
+    Remap a single transformer weight key from the original ACE-Step naming convention
+    to the diffusers naming convention.
+
+    Changes:
+    - time_embed.time_proj.* -> timestep_proj (stateless, no weights)
+    - time_embed.time_embed.* -> time_embed.* (TimestepEmbedding)
+    - time_embed.adaln.* -> adaln_single.*
+    - time_embed_r.time_proj_r.* -> timestep_proj_r (stateless, no weights)
+    - time_embed_r.time_embed_r.* -> time_embed_r.* (TimestepEmbedding)
+    - time_embed_r.adaln_r.* -> adaln_single_r.*
+    - *.self_attn.q_proj.* -> *.self_attn.to_q.*
+    - *.self_attn.k_proj.* -> *.self_attn.to_k.*
+    - *.self_attn.v_proj.* -> *.self_attn.to_v.*
+    - *.self_attn.o_proj.* -> *.self_attn.to_out.0.*
+    - *.self_attn.q_norm.* -> *.self_attn.norm_q.*
+    - *.self_attn.k_norm.* -> *.self_attn.norm_k.*
+    - *.cross_attn.q_proj.* -> *.cross_attn.to_q.*
+    - *.cross_attn.k_proj.* -> *.cross_attn.to_k.*
+    - *.cross_attn.v_proj.* -> *.cross_attn.to_v.*
+    - *.cross_attn.o_proj.* -> *.cross_attn.to_out.0.*
+    - *.cross_attn.q_norm.* -> *.cross_attn.norm_q.*
+    - *.cross_attn.k_norm.* -> *.cross_attn.norm_k.*
+    """
+    # Timestep embedding remapping for main timestep
+    if key.startswith("time_embed.time_embed."):
+        return key.replace("time_embed.time_embed.", "time_embed.")
+    if key.startswith("time_embed.adaln."):
+        return key.replace("time_embed.adaln.", "adaln_single.")
+
+    # Timestep embedding remapping for reference timestep
+    if key.startswith("time_embed_r.time_embed_r."):
+        return key.replace("time_embed_r.time_embed_r.", "time_embed_r.")
+    if key.startswith("time_embed_r.adaln_r."):
+        return key.replace("time_embed_r.adaln_r.", "adaln_single_r.")
+
+    # Attention projection remapping (works for both self_attn and cross_attn)
+    attention_replacements = [
+        (".q_proj.", ".to_q."),
+        (".k_proj.", ".to_k."),
+        (".v_proj.", ".to_v."),
+        (".o_proj.", ".to_out.0."),
+        (".q_norm.", ".norm_q."),
+        (".k_norm.", ".norm_k."),
+    ]
+    for old, new in attention_replacements:
+        if old in key:
+            key = key.replace(old, new)
+            break
+
+    return key
+
+
+def _remap_condition_encoder_key(key: str) -> str:
+    """
+    Remap a single condition encoder weight key from the original ACE-Step naming
+    convention to the diffusers naming convention.
+
+    Same attention projection remapping as the transformer.
+    """
+    attention_replacements = [
+        (".q_proj.", ".to_q."),
+        (".k_proj.", ".to_k."),
+        (".v_proj.", ".to_v."),
+        (".o_proj.", ".to_out.0."),
+        (".q_norm.", ".norm_q."),
+        (".k_norm.", ".norm_k."),
+    ]
+    for old, new in attention_replacements:
+        if old in key:
+            key = key.replace(old, new)
+            break
+
+    return key
 
 
 def convert_ace_step_weights(checkpoint_dir, dit_config, output_dir, dtype_str="bf16"):
@@ -91,7 +174,7 @@ def convert_ace_step_weights(checkpoint_dir, dit_config, output_dir, dtype_str="
     print(f"  Total keys: {len(state_dict)}")
 
     # =========================================================================
-    # 1. Split weights by prefix
+    # 1. Split weights by prefix and remap keys
     # =========================================================================
     transformer_sd = {}
     condition_encoder_sd = {}
@@ -100,7 +183,7 @@ def convert_ace_step_weights(checkpoint_dir, dit_config, output_dir, dtype_str="
     for key, value in state_dict.items():
         if key.startswith("decoder."):
             # Strip "decoder." prefix for the transformer
-            new_key = key[len("decoder.") :]
+            new_key = key[len("decoder."):]
             # The original model uses nn.Sequential for proj_in/proj_out:
             #   proj_in = Sequential(Lambda, Conv1d, Lambda)
             #   proj_out = Sequential(Lambda, ConvTranspose1d, Lambda)
@@ -108,10 +191,14 @@ def convert_ace_step_weights(checkpoint_dir, dit_config, output_dir, dtype_str="
             # In diffusers, we use standalone Conv1d/ConvTranspose1d named proj_in_conv/proj_out_conv.
             new_key = new_key.replace("proj_in.1.", "proj_in_conv.")
             new_key = new_key.replace("proj_out.1.", "proj_out_conv.")
+            # Remap attention/timestep parameter names
+            new_key = _remap_transformer_key(new_key)
             transformer_sd[new_key] = value.to(target_dtype)
         elif key.startswith("encoder."):
             # Strip "encoder." prefix for the condition encoder
-            new_key = key[len("encoder.") :]
+            new_key = key[len("encoder."):]
+            # Remap attention parameter names
+            new_key = _remap_condition_encoder_key(new_key)
             condition_encoder_sd[new_key] = value.to(target_dtype)
         else:
             other_sd[key] = value.to(target_dtype)
@@ -124,9 +211,9 @@ def convert_ace_step_weights(checkpoint_dir, dit_config, output_dir, dtype_str="
     # 2. Build configs for each sub-model
     # =========================================================================
 
-    # Transformer (DiT) config
+    # Transformer (DiT) config - uses AceStepTransformer1DModel
     transformer_config = {
-        "_class_name": "AceStepDiTModel",
+        "_class_name": "AceStepTransformer1DModel",
         "_diffusers_version": "0.33.0.dev0",
         "hidden_size": original_config["hidden_size"],
         "intermediate_size": original_config["intermediate_size"],
@@ -137,12 +224,10 @@ def convert_ace_step_weights(checkpoint_dir, dit_config, output_dir, dtype_str="
         "in_channels": original_config["in_channels"],
         "audio_acoustic_hidden_dim": original_config["audio_acoustic_hidden_dim"],
         "patch_size": original_config["patch_size"],
-        "max_position_embeddings": original_config["max_position_embeddings"],
         "rope_theta": original_config["rope_theta"],
         "attention_bias": original_config["attention_bias"],
         "attention_dropout": original_config["attention_dropout"],
         "rms_norm_eps": original_config["rms_norm_eps"],
-        "use_sliding_window": original_config["use_sliding_window"],
         "sliding_window": original_config["sliding_window"],
         "layer_types": original_config["layer_types"],
     }
@@ -160,12 +245,10 @@ def convert_ace_step_weights(checkpoint_dir, dit_config, output_dir, dtype_str="
         "num_attention_heads": original_config["num_attention_heads"],
         "num_key_value_heads": original_config["num_key_value_heads"],
         "head_dim": original_config["head_dim"],
-        "max_position_embeddings": original_config["max_position_embeddings"],
         "rope_theta": original_config["rope_theta"],
         "attention_bias": original_config["attention_bias"],
         "attention_dropout": original_config["attention_dropout"],
         "rms_norm_eps": original_config["rms_norm_eps"],
-        "use_sliding_window": original_config["use_sliding_window"],
         "sliding_window": original_config["sliding_window"],
     }
 
@@ -194,7 +277,7 @@ def convert_ace_step_weights(checkpoint_dir, dit_config, output_dir, dtype_str="
         "condition_encoder": ["diffusers", "AceStepConditionEncoder"],
         "text_encoder": ["transformers", text_encoder_class_name],
         "tokenizer": ["transformers", tokenizer_class_name],
-        "transformer": ["diffusers", "AceStepDiTModel"],
+        "transformer": ["diffusers", "AceStepTransformer1DModel"],
         "vae": ["diffusers", "AutoencoderOobleck"],
     }
 
@@ -288,7 +371,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint_dir",
         type=str,
-        required=True,
+        default=None,
         help="Path to the ACE-Step checkpoints directory (containing vae/, Qwen3-Embedding-0.6B/, and dit config dirs)",
     )
     parser.add_argument(
@@ -310,10 +393,27 @@ if __name__ == "__main__":
         choices=["fp32", "fp16", "bf16"],
         help="Data type for saved weights (default: bf16)",
     )
+    parser.add_argument(
+        "--repo_id",
+        type=str,
+        default=None,
+        help="HuggingFace Hub repo ID to download checkpoints from (e.g., ACE-Step/ACE-Step-v1-5-turbo)",
+    )
 
     args = parser.parse_args()
+
+    if args.repo_id is not None:
+        from huggingface_hub import snapshot_download
+
+        checkpoint_dir = snapshot_download(repo_id=args.repo_id)
+        print(f"Downloaded checkpoint from {args.repo_id} to {checkpoint_dir}")
+    elif args.checkpoint_dir is not None:
+        checkpoint_dir = args.checkpoint_dir
+    else:
+        raise ValueError("Must provide either --checkpoint_dir or --repo_id")
+
     convert_ace_step_weights(
-        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_dir=checkpoint_dir,
         dit_config=args.dit_config,
         output_dir=args.output_dir,
         dtype_str=args.dtype,

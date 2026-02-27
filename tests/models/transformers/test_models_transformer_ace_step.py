@@ -15,7 +15,7 @@
 
 import torch
 
-from diffusers.models.transformers.ace_step_transformer import AceStepDiTModel
+from diffusers.models.transformers.ace_step_transformer import AceStepTransformer1DModel
 from diffusers.utils.torch_utils import randn_tensor
 
 from ...testing_utils import enable_full_determinism, torch_device
@@ -30,10 +30,10 @@ from ..testing_utils import (
 enable_full_determinism()
 
 
-class AceStepDiTModelTesterConfig(BaseModelTesterConfig):
+class AceStepTransformer1DModelTesterConfig(BaseModelTesterConfig):
     @property
     def model_class(self):
-        return AceStepDiTModel
+        return AceStepTransformer1DModel
 
     @property
     def output_shape(self):
@@ -67,12 +67,10 @@ class AceStepDiTModelTesterConfig(BaseModelTesterConfig):
             "in_channels": 24,
             "audio_acoustic_hidden_dim": 8,
             "patch_size": 2,
-            "max_position_embeddings": 256,
             "rope_theta": 10000.0,
             "attention_bias": False,
             "attention_dropout": 0.0,
             "rms_norm_eps": 1e-6,
-            "use_sliding_window": False,
             "sliding_window": 16,
         }
 
@@ -98,21 +96,21 @@ class AceStepDiTModelTesterConfig(BaseModelTesterConfig):
         }
 
 
-class TestAceStepDiTModel(AceStepDiTModelTesterConfig, ModelTesterMixin):
-    """Core model tests for AceStepDiTModel."""
+class TestAceStepTransformer1DModel(AceStepTransformer1DModelTesterConfig, ModelTesterMixin):
+    """Core model tests for AceStepTransformer1DModel."""
 
     def _check_dtype_inference_output(self, output, output_loaded, dtype, atol=2e-2, rtol=0):
         """Increase tolerance for half-precision inference with tiny random models."""
         super()._check_dtype_inference_output(output, output_loaded, dtype, atol=atol, rtol=rtol)
 
 
-class TestAceStepDiTModelMemory(AceStepDiTModelTesterConfig, MemoryTesterMixin):
-    """Memory optimization tests for AceStepDiTModel."""
+class TestAceStepTransformer1DModelMemory(AceStepTransformer1DModelTesterConfig, MemoryTesterMixin):
+    """Memory optimization tests for AceStepTransformer1DModel."""
 
     pass
 
 
-class TestAceStepDiTModelTraining(AceStepDiTModelTesterConfig, TrainingTesterMixin):
-    """Training tests for AceStepDiTModel."""
+class TestAceStepTransformer1DModelTraining(AceStepTransformer1DModelTesterConfig, TrainingTesterMixin):
+    """Training tests for AceStepTransformer1DModel."""
 
     pass
