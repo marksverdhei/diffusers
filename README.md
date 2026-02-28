@@ -14,6 +14,42 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
+<h1 align="center">ht-diffusers</h1>
+
+<p align="center">
+    <em>Heiervang Technologies fork of <a href="https://github.com/huggingface/diffusers">Diffusers</a></em>
+</p>
+
+<p align="center">
+    <a href="https://github.com/orgs/heiervang-technologies/discussions">HT Discussions</a> |
+    <a href="https://github.com/orgs/heiervang-technologies/discussions/3">Fork Management Guide</a> |
+    <a href="https://github.com/huggingface/diffusers">Upstream Project</a>
+</p>
+
+---
+
+## HT Fork Changes
+
+This is the **Heiervang Technologies** fork of [Diffusers](https://github.com/huggingface/diffusers). The `main` branch is kept as a clean fast-forward mirror of upstream. All HT-specific changes live on the `ht` branch.
+
+### What's different from upstream
+
+| Change | Description | Contributed back? |
+|--------|-------------|:-----------------:|
+| ACE-Step pipeline | Text-to-music generation pipeline with multi-task support | [PR #13095](https://github.com/huggingface/diffusers/pull/13095) |
+| HT fork docs | This section, updated CONTRIBUTING.md with fork management guide | No |
+
+### Branch strategy
+
+- **`main`** — Clean mirror of upstream. Never modified directly.
+- **`ht`** — Default branch. Contains all HT-specific additions rebased on top of `main`.
+
+For questions, feature requests, or bug reports related to this fork, please use the [HT Discussions page](https://github.com/orgs/heiervang-technologies/discussions). For upstream issues, use the [upstream repository](https://github.com/huggingface/diffusers/issues).
+
+See the [HT Fork Management Guide](https://github.com/orgs/heiervang-technologies/discussions/3) for our branch conventions, sync workflow, and contribution process.
+
+---
+
 <p align="center">
     <br>
     <img src="https://raw.githubusercontent.com/huggingface/diffusers/main/docs/source/en/imgs/diffusers_library.jpg" width="400"/>
